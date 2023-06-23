@@ -1,5 +1,5 @@
 # Installation
-Modified from bevformer and mmdetection3d.
+> Modified from bevformer and mmdetection3d.
 
 **a. Env: Create a conda virtual environment and activate it.**
 ```shell
@@ -63,7 +63,7 @@ pip install -r requirements.txt
 
 **i. Prepare pretrained weights.**
 ```shell
-mkdir ckpts
+mkdir ckpts && cd ckpts
 
 # Pretrained weights of bevformer
 # Also the initial state of training stage1 model
@@ -75,3 +75,6 @@ wget https://github.com/OpenDriveLab/UniAD/releases/download/v1.0/uniad_base_tra
 # Pretrained weights of stage2 model (fully functional UniAD)
 wget https://github.com/OpenDriveLab/UniAD/releases/download/v1.0/uniad_base_e2e.pth
 ```
+
+---
+-> Next Page: [Prepare The Dataset](./DATA_PREP.md)

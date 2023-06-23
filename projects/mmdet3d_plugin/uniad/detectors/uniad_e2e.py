@@ -199,6 +199,7 @@ class UniAD(UniADTrack):
         # Forward Occ Head
         if self.with_occ_head:
             if outs_motion['track_query'].shape[1] == 0:
+                # TODO: rm hard code
                 outs_motion['track_query'] = torch.zeros((1, 1, 256)).to(bev_embed)
                 outs_motion['track_query_pos'] = torch.zeros((1,1, 256)).to(bev_embed)
                 outs_motion['traj_query'] = torch.zeros((3, 1, 1, 6, 256)).to(bev_embed)
@@ -328,14 +329,11 @@ class UniAD(UniADTrack):
                 result_planning=result_planning,
             )
 
-        if self.with_seg_head:
-            del result_seg[0]['args_tuple']
-        
         pop_track_list = ['prev_bev', 'bev_pos', 'bev_embed', 'track_query_embeddings', 'sdc_embedding']
         result_track[0] = pop_elem_in_result(result_track[0], pop_track_list)
 
         if self.with_seg_head:
-            result_seg[0] = pop_elem_in_result(result_seg[0], pop_list=['pts_bbox'])
+            result_seg[0] = pop_elem_in_result(result_seg[0], pop_list=['pts_bbox', 'args_tuple'])
         if self.with_motion_head:
             result_motion[0] = pop_elem_in_result(result_motion[0])
         if self.with_occ_head:

@@ -66,8 +66,9 @@ class UniADTrack(MVXTwoStageDetector):
         filter_score_thresh=0.1,
         miss_tolerance=5,
         gt_iou_threshold=0.0,
-
-        freeze_img_modules=False,   # * Remember to use it
+        freeze_img_backbone=False,
+        freeze_img_neck=False,
+        freeze_bn=False,
         freeze_bev_encoder=False,
         queue_length=3,
     ):
@@ -87,14 +88,21 @@ class UniADTrack(MVXTwoStageDetector):
         self.fp16_enabled = False
         self.embed_dims = embed_dims
         self.num_query = num_query
-        self.freeze_img_modules = freeze_img_modules
         self.num_classes = num_classes
         self.vehicle_id_list = vehicle_id_list
         self.pc_range = pc_range
         self.queue_length = queue_length
-        if self.freeze_img_modules:
-            self.img_backbone.eval()
-            self.img_neck.eval()
+        if freeze_img_backbone:
+            if freeze_bn:
+                self.img_backbone.eval()
+            for param in self.img_backbone.parameters():
+                param.requires_grad = False
+        
+        if freeze_img_neck:
+            if freeze_bn:
+                self.img_neck.eval()
+            for param in self.img_neck.parameters():
+                param.requires_grad = False
 
         # temporal
         self.video_test_mode = video_test_mode
@@ -106,12 +114,10 @@ class UniADTrack(MVXTwoStageDetector):
             "prev_pos": 0,
             "prev_angle": 0,
         }
-        self.query_embedding = nn.Embedding(self.num_query+1, self.embed_dims * 2) 
+        self.query_embedding = nn.Embedding(self.num_query+1, self.embed_dims * 2)   # the final one is ego query, which constantly models ego-vehicle
         self.reference_points = nn.Linear(self.embed_dims, 3)
-        self.bbox_size_fc = nn.Linear(self.embed_dims, 3)
 
         self.mem_bank_len = mem_args["memory_bank_len"]
-        self.memory_bank = None
         self.track_base = RuntimeTrackerBase(
             score_thresh=score_thresh,
             filter_score_thresh=filter_score_thresh,
@@ -169,16 +175,6 @@ class UniADTrack(MVXTwoStageDetector):
             img_feats_reshaped.append(img_feat_reshaped)
         return img_feats_reshaped
 
-    @auto_fp16(apply_to=("img"))
-    def extract_feat(self, img, len_queue=None):
-        """Extract features from images and points."""
-        if self.freeze_img_modules:
-            with torch.no_grad():
-                img_feats = self.extract_img_feat(img, len_queue=len_queue)
-        else:
-            img_feats = self.extract_img_feat(img, len_queue=len_queue)
-        return img_feats
-
     def _generate_empty_tracks(self):
         track_instances = Instances((1, 1))
         num_queries, dim = self.query_embedding.weight.shape  # (300, 256 * 2)
@@ -187,14 +183,9 @@ class UniADTrack(MVXTwoStageDetector):
         track_instances.ref_pts = self.reference_points(query[..., : dim // 2])
 
         # init boxes: xy, wl, z, h, sin, cos, vx, vy, vz
-        box_sizes = self.bbox_size_fc(query[..., : dim // 2])
         pred_boxes_init = torch.zeros(
             (len(track_instances), 10), dtype=torch.float, device=device
         )
-
-        pred_boxes_init[..., 2:4] = box_sizes[..., 0:2]
-        pred_boxes_init[..., 5:6] = box_sizes[..., 2:3]
-
         track_instances.query = query
 
         track_instances.output_embedding = torch.zeros(
@@ -331,7 +322,7 @@ class UniADTrack(MVXTwoStageDetector):
             prev_bev = None
             bs, len_queue, num_cams, C, H, W = imgs_queue.shape
             imgs_queue = imgs_queue.reshape(bs * len_queue, num_cams, C, H, W)
-            img_feats_list = self.extract_feat(img=imgs_queue, len_queue=len_queue)
+            img_feats_list = self.extract_img_feat(img=imgs_queue, len_queue=len_queue)
             for i in range(len_queue):
                 img_metas = [each[i] for each in img_metas_list]
                 img_feats = [each_scale[:, i] for each_scale in img_feats_list]
@@ -348,7 +339,7 @@ class UniADTrack(MVXTwoStageDetector):
             assert prev_bev is None
             prev_bev = self.get_history_bev(prev_img, prev_img_metas)
 
-        img_feats = self.extract_feat(img=imgs)
+        img_feats = self.extract_img_feat(img=imgs)
         if self.freeze_bev_encoder:
             with torch.no_grad():
                 bev_embed, bev_pos = self.pts_bbox_head.get_bev_features(
@@ -364,7 +355,7 @@ class UniADTrack(MVXTwoStageDetector):
         return bev_embed, bev_pos
 
     @auto_fp16(apply_to=("img", "prev_bev"))
-    def _forward_single_frame(
+    def _forward_single_frame_train(
         self,
         img,
         img_metas,
@@ -431,6 +422,7 @@ class UniADTrack(MVXTwoStageDetector):
         track_instances.output_embedding = query_feats[-1][0]  # [300, feat_dim]
         velo = output_coords[-1, 0, :, -2:]  # [num_query, 3]
         if l2g_r2 is not None:
+            # Update ref_pts for next frame considering each agent's velocity
             ref_pts = self.velo_update(
                 last_ref_pts[0],
                 velo,
@@ -560,7 +552,7 @@ class UniADTrack(MVXTwoStageDetector):
             all_matched_idxes = []
             all_instances_pred_logits = []
             all_instances_pred_boxes = []
-            frame_res = self._forward_single_frame(
+            frame_res = self._forward_single_frame_train(
                 img_single,
                 img_metas_single,
                 track_instances,
@@ -579,11 +571,12 @@ class UniADTrack(MVXTwoStageDetector):
             # all_query_embeddings: len=dec nums, N*256
             # all_matched_idxes: len=dec nums, N*2
             track_instances = frame_res["track_instances"]
-            if i == num_frame - 1:
-                get_keys = ["bev_embed", "bev_pos",
-                            "track_query_embeddings", "track_query_matched_idxes", "track_bbox_results",
-                            "sdc_boxes_3d", "sdc_scores_3d", "sdc_track_scores", "sdc_track_bbox_results", "sdc_embedding"]
-                out.update({k: frame_res[k] for k in get_keys})
+        
+        get_keys = ["bev_embed", "bev_pos",
+                    "track_query_embeddings", "track_query_matched_idxes", "track_bbox_results",
+                    "sdc_boxes_3d", "sdc_scores_3d", "sdc_track_scores", "sdc_track_bbox_results", "sdc_embedding"]
+        out.update({k: frame_res[k] for k in get_keys})
+        
         losses = self.criterion.losses_dict
         return losses, out
 
@@ -624,7 +617,7 @@ class UniADTrack(MVXTwoStageDetector):
         return outs_track
 
 
-    def _inference_single_frame(
+    def _forward_single_frame_inference(
         self,
         img,
         img_metas,
@@ -752,7 +745,7 @@ class UniADTrack(MVXTwoStageDetector):
 
         """ predict and update """
         prev_bev = self.prev_bev
-        frame_res = self._inference_single_frame(
+        frame_res = self._forward_single_frame_inference(
             img,
             img_metas,
             track_instances,
